@@ -2,7 +2,7 @@
 
 **Gokul Krishnaa** | `[engineer-004] - Gokul Krishnaa`
 
-*Working demo: [github.com/gananthakris/real-time-analytics-demo](https://github.com/gananthakris/real-time-analytics-demo) — Docker Compose stack (Kafka + ClickHouse + PyFlink + React dashboard), verified at 65M events/day, 45ms p95 ingestion, 2.3s p95 end-to-end.*
+*Working demo: [github.com/gananthakris/real-time-analytics-demo](https://github.com/gananthakris/real-time-analytics-demo) — Docker Compose stack (Kafka + ClickHouse + Python processor + React dashboard). Local demo confirms full pipeline works end-to-end; production scale targets (65M events/day, 2.3s p95 e2e) are architecture design goals for the MSK + Fargate + ARM ClickHouse deployment described below.*
 
 ---
 
@@ -328,18 +328,25 @@ Surfaces actionable conclusions without requiring customers to build their own a
 
 **ARM Graviton2 savings alone: $609/month.** Combined OLAP + processing + compute savings: **$10,893/month.**
 
-### Load Test Proof
+### Load Test Results (Local Demo)
 
 ```
 python load_test.py --events 1000 --rps 100
 
-Results:
+Results (local Docker Compose, MacBook M-series):
 ✓ 1,000 events sent in 10.2 seconds
 ✓ 100% success rate
-✓ Ingestion p95 latency: 45ms
-✓ End-to-end p95 latency: 2.3s
-✓ Sustained throughput: 65M events/day verified
+✓ Ingestion p95 latency: 45ms  ← HTTP 202 response time (measured)
+  (time from POST /track to Accepted — includes Kafka write)
 ```
+
+**What this measures:** ingestion API acceptance latency only — the time for the service to validate, enrich, write to Kafka, and return 202. End-to-end pipeline (Kafka → processor → ClickHouse → queryable) was manually confirmed to complete within ~3–4 seconds on the local stack.
+
+**Production scale targets** (architecture design, not local benchmark):
+- 65M events/day at 752 RPS sustained — achievable on 50-partition MSK + 4–32 Fargate tasks
+- 2.3s p95 end-to-end — Flink checkpoint interval 30s, ClickHouse async insert buffer 10s, dashboard poll 5s
+
+The local demo runs a Python event processor (not production Flink) and a single-node ClickHouse container. It demonstrates the full data path and AI query feature are correct; production throughput requires the AWS deployment described above.
 
 ### With More Time
 
