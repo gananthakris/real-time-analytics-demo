@@ -1,0 +1,247 @@
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;1,9..40,300&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+*, *::before, *::after { box-sizing: border-box; }
+
+:root {
+  --void:    #080c10;
+  --surface: #0d1420;
+  --panel:   #111827;
+  --border:  #1e2d3d;
+  --muted:   #374151;
+  --dim:     #6b7280;
+  --ghost:   #9ca3af;
+  --text:    #e2e8f0;
+  --amber:   #f59e0b;
+  --amber-l: #fbbf24;
+  --cyan:    #22d3ee;
+  --green:   #10b981;
+  --red:     #f87171;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  background: var(--void);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* Noise texture overlay */
+.noise::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 1;
+  border-radius: inherit;
+}
+
+/* SQL syntax highlighting */
+.sql-keyword { color: var(--amber); font-weight: 600; }
+.sql-string  { color: var(--green); }
+.sql-number  { color: var(--cyan); }
+.sql-comment { color: var(--dim); font-style: italic; }
+.sql-fn      { color: #c084fc; }
+
+/* Stat card glow on hover */
+.stat-card {
+  position: relative;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px -8px rgba(0,0,0,0.5);
+}
+
+/* Live pulse */
+.live-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.5; transform: scale(0.8); }
+}
+
+/* Fade up stagger for cards */
+.stagger-1 { animation: fade-up 0.4s 0.05s ease both; }
+.stagger-2 { animation: fade-up 0.4s 0.1s  ease both; }
+.stagger-3 { animation: fade-up 0.4s 0.15s ease both; }
+.stagger-4 { animation: fade-up 0.4s 0.2s  ease both; }
+.stagger-5 { animation: fade-up 0.4s 0.25s ease both; }
+.stagger-6 { animation: fade-up 0.4s 0.3s  ease both; }
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slide-in {
+  from { opacity: 0; transform: translateX(-10px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* AI textarea focus glow */
+.query-textarea:focus {
+  outline: none;
+  border-color: var(--amber);
+  box-shadow: 0 0 0 3px rgba(245,158,11,0.12), inset 0 0 24px rgba(245,158,11,0.03);
+}
+
+/* Amber button glow */
+.btn-amber {
+  background: var(--amber);
+  color: #000;
+  font-weight: 600;
+  transition: background 0.15s, box-shadow 0.15s, transform 0.1s;
+}
+.btn-amber:hover:not(:disabled) {
+  background: var(--amber-l);
+  box-shadow: 0 0 20px rgba(245,158,11,0.4);
+}
+.btn-amber:active:not(:disabled) {
+  transform: scale(0.97);
+}
+.btn-amber:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Data table */
+.data-table th {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.data-table td {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  color: var(--text);
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(30,45,61,0.5);
+}
+.data-table tr:hover td { background: rgba(245,158,11,0.04); }
+
+/* Chip / tag */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 12px;
+  border-radius: 100px;
+  border: 1px solid var(--border);
+  font-size: 0.72rem;
+  color: var(--ghost);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  white-space: nowrap;
+}
+.chip:hover {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: rgba(245,158,11,0.06);
+}
+
+/* Sidebar nav item */
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--dim);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+  border: none;
+  background: transparent;
+  width: 100%;
+  text-align: left;
+}
+.nav-item:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+.nav-item.active {
+  color: var(--amber);
+  background: rgba(245,158,11,0.1);
+  border-left: 2px solid var(--amber);
+  padding-left: 12px;
+}
+
+/* Panel base */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+/* Number count animation */
+@keyframes countUp {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.count-up { animation: countUp 0.5s ease both; }
+
+/* Metric bar */
+.metric-bar {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+.metric-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 1s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Result row glow */
+.result-row-new {
+  animation: row-flash 1.5s ease;
+}
+@keyframes row-flash {
+  0%   { background: rgba(245,158,11,0.12); }
+  100% { background: transparent; }
+}
+
+/* Gradient separator */
+.separator {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--border), transparent);
+}
+
+/* Scanline subtle effect on sidebar */
+.scanlines {
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(255,255,255,0.015) 2px,
+    rgba(255,255,255,0.015) 4px
+  );
+}
