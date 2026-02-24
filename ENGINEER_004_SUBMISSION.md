@@ -72,7 +72,7 @@ Every reprocessing job, schema migration, segment backfill, or GDPR correction i
 
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
-| Streaming | MSK Kafka, 50 partitions, ARM (m6g) | md5 partition key ensures ordered per-tenant processing; 17× headroom at average load |
+| Streaming | MSK Kafka, 50 partitions, ARM (m6g) | md5(customer_id+visitor_id) key ensures per-visitor event ordering (required for session detection); 50 partitions provide headroom at 10× average load |
 | Processing | PyFlink on Fargate Spot | $905/month (10 workers) vs KDA $3,330/month — 60% cheaper; full Python stack; full Flink control |
 | OLAP | ClickHouse only, ARM Graviton2 | Replaces Timestream+ClickHouse dual OLAP; sub-100ms p99 on billions of rows |
 | User state | DynamoDB on-demand | Handles write bursts without capacity planning; single-digit ms writes |
@@ -171,15 +171,18 @@ Without retractions (accumulating-only mode), a downstream count of "sessions co
 ### Compound Trigger (Production Configuration)
 
 ```python
-# Beam/PyFlink windowing strategy (accumulation_mode is a Window property, not Trigger)
+# PyFlink DataStream API (accumulation_mode is a Window property, not chained on Trigger)
 beam.WindowInto(
     window.Sessions(gap_size=30 * 60),
     trigger=trigger.AfterWatermark(
-        early=trigger.AfterProcessingTime(delay=30),  # UnalignedDelay(30s) per window
+        early=trigger.AfterProcessingTime(delay=30),  # unaligned: each window fires independently
         late=trigger.AfterCount(1),
     ),
     allowed_lateness=3 * 60,
-    accumulation_mode=trigger.AccumulationMode.ACCUMULATING_AND_RETRACTING,
+    accumulation_mode=trigger.AccumulationMode.ACCUMULATING,  # Beam Python SDK
+    # Note: retraction streams (emit merged session + retract constituents) are implemented
+    # via Flink SQL retract mode or a separate side-output pattern in the DataStream API,
+    # not as a Beam AccumulationMode enum value in the Python SDK.
 )
 ```
 
@@ -337,7 +340,7 @@ Surfaces actionable conclusions without requiring customers to build their own a
 | Dev + staging environments (~25% of prod) | $5,184 | Required for safe rollout phases |
 | **Total** | **~$22,200** | **37% below Claude's $35K baseline** |
 
-**ARM Graviton2 savings alone: $609/month.** Combined OLAP + processing + compute savings: **$10,893/month.**
+**ARM Graviton2 savings alone: ~$477/month** (corrected; see benchmark footnote above). Combined OLAP + Flink + ARM compute savings: **$7,860 + $2,424 + $477 = ~$10,761/month.**
 
 ### Load Test Results (Local Demo)
 
