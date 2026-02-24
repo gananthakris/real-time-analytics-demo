@@ -64,7 +64,7 @@ Every reprocessing job, schema migration, segment backfill, or GDPR correction i
                ┌────────▼────────┐
                │  Dashboard API  │
                │  WebSocket push │
-               │  <2.3s p95      │
+               │  <3s p95 (raw) │
                └─────────────────┘
 ```
 
@@ -86,9 +86,9 @@ Every reprocessing job, schema migration, segment backfill, or GDPR correction i
 | COUNT(*) | 1.2s | 1.0s | 17% faster |
 | Complex JOIN | 5.4s | 4.8s | 11% faster |
 | Aggregation | 3.1s | 2.7s | 13% faster |
-| Hourly cost | $0.315/hr | $0.252/hr | **20% cheaper** |
+| Hourly cost | $0.252/hr | $0.202/hr | **20% cheaper** |
 
-3 ClickHouse nodes × $63/month savings + 3 MSK brokers × $19/month savings = **$609/month** on compute alone.
+*(Benchmark run on xlarge; production nodes are r6g.4xlarge.)* 3 ClickHouse nodes (r6g.4xlarge $0.806/hr vs r6i.4xlarge $1.008/hr, us-east-1 on-demand) × $145/month savings + 3 MSK brokers (m6g.large vs m5.large) × $14/month savings = **~$477/month** on compute alone.
 
 ### ClickHouse DDL
 
@@ -124,11 +124,17 @@ FROM events_raw
 GROUP BY customer_id, event_type, hour;
 ```
 
-**GDPR fast path:** `ALTER TABLE events_raw DROP PARTITION 'customer_123'` — metadata-only operation, ~1 second, no table scan, no row lock. Instant legal compliance.
+**GDPR fast path:** Because the partition key is a tuple `(customer_id, toYYYYMM(event_time))`, each monthly partition is addressed as `('customer_123', 202501)`. Deletion requires one statement per retained month (typically ≤24 operations for a 2-year hot window):
+```sql
+ALTER TABLE events_raw DROP PARTITION ('customer_123', 202501);
+ALTER TABLE events_raw DROP PARTITION ('customer_123', 202502);
+-- ... one per month; enumerate from system.parts first
+```
+Each statement is metadata-only, ~1 second, no table scan, no row lock. Total wall-clock time: under 30 seconds regardless of data volume.
 
 ### Multi-Tenant Isolation
 
-**Kafka:** 50 partitions (vs default 3). Partition key: `md5(customer_id + visitor_id)` — same customer always routes to same partition, guaranteeing ordered processing and easy per-tenant lag monitoring.
+**Kafka:** 50 partitions (vs default 3). Partition key: `md5(customer_id + visitor_id)` — same visitor always routes to the same partition, guaranteeing per-visitor event ordering (critical for session detection). A single customer's traffic is intentionally spread across partitions for parallelism; per-tenant lag monitoring uses consumer group lag aggregated across all partitions.
 
 **Redis token bucket rate limiter:**
 ```python
@@ -164,12 +170,17 @@ Without retractions (accumulating-only mode), a downstream count of "sessions co
 
 ### Compound Trigger (Production Configuration)
 
-```
-AfterWatermark()
-  .withEarlyFirings(UnalignedDelay(30s))   -- speculative results every ~30s
-  .withLateFirings(AfterCount(1))           -- incorporate late-arriving mobile events
-.withAllowedLateness(3 minutes)
-.accumulatingFiredPanes()
+```python
+# Beam/PyFlink windowing strategy (accumulation_mode is a Window property, not Trigger)
+beam.WindowInto(
+    window.Sessions(gap_size=30 * 60),
+    trigger=trigger.AfterWatermark(
+        early=trigger.AfterProcessingTime(delay=30),  # UnalignedDelay(30s) per window
+        late=trigger.AfterCount(1),
+    ),
+    allowed_lateness=3 * 60,
+    accumulation_mode=trigger.AccumulationMode.ACCUMULATING_AND_RETRACTING,
+)
 ```
 
 **Unaligned** early firings spread output load across time. Aligned delays fire all windows simultaneously — thundering herd on ClickHouse write pressure. On-time pane (when watermark passes window end) is the "official" result used for correctness checks.
@@ -183,7 +194,7 @@ AfterWatermark()
 | P99 | <30s | <3 min |
 | Tail (>P99) | — | offline batches, up to 24h |
 
-3-minute `withAllowedLateness` captures P99 mobile events. Tail events (offline batches) land in S3 raw and flow through the late-data reconciliation path: daily Flink job reads from Kafka retained log, backfills ClickHouse via `ReplacingMergeTree` (last-write-wins by `(event_id, version)`).
+3-minute `withAllowedLateness` captures P99 mobile events. Tail events (offline batches) land in S3 raw and flow through a late-data reconciliation path: a daily Flink job reads from the Kafka retained log and writes to a separate `events_dedup` table (`ENGINE = ReplacingMergeTree(version)`, deduplicated by `(event_id, customer_id)`). The main `events_raw` table uses plain `MergeTree` for maximum write throughput; dedup queries use `events_dedup FINAL`.
 
 **Per-partition idle detection:** If a Kafka partition has no new events for 5 minutes, Flink excludes it from watermark calculation. Without this, one idle partition stalls the global watermark, stalling all session and tumbling windows. CloudWatch alert on `MaxOffsetLag > 60 seconds`.
 
@@ -193,7 +204,7 @@ AfterWatermark()
 
 2. **Flink checkpoints:** S3-backed checkpoints every 30 seconds. Kafka offsets committed only after checkpoint success. On failure, replay from last checkpoint — each event processes exactly once in Flink state.
 
-3. **ClickHouse sink:** `Reshuffle` operator before write step gives each record a stable deterministic identity even after upstream retry. ClickHouse receives idempotent upserts keyed by `(event_id, customer_id)`.
+3. **ClickHouse sink:** `Reshuffle` operator before write step gives each record a stable deterministic identity even after upstream retry. Writes go to `events_raw` (MergeTree — high-throughput inserts, no dedup overhead) and in parallel to `events_dedup` (ReplacingMergeTree — last-write-wins by `(event_id, customer_id)` for exact-once correctness queries).
 
 4. **Bloom filter dedup:** Per-10-minute Bloom filters of `event_id`s seen, maintained in-memory. Check latency: <1μs. False positives resolved against a small catalog. >99.9% of non-duplicate events skip the catalog entirely. (Inspired by Dataflow's approach to at-least-once → exactly-once.)
 
@@ -207,7 +218,7 @@ AfterWatermark()
 Union-find graph with daily compaction in Lambda. Historical backfill: on identity resolution, emit `identity_resolved` event to Kafka; Flink job reattributes last 30 days of S3 raw events into ClickHouse. Result: 95% of visitors identified (vs 60% with login-only).
 
 **GDPR — two-tier deletion:**
-- **Hot data (ClickHouse):** `ALTER TABLE events_raw DROP PARTITION 'customer_123'` — metadata-only, ~1 second.
+- **Hot data (ClickHouse):** Drop each monthly partition for the customer: `ALTER TABLE events_raw DROP PARTITION ('customer_123', 202501)` — repeated per retained month (≤24 ops), each metadata-only, ~1 second each.
 - **Cold data (S3 Parquet):** Cryptographic shredding (from DDIA Ch. 12). All PII fields encrypted with per-user AES-256 keys in AWS Secrets Manager (deletion-protected, 7-day recovery window, all key deletions logged to CloudTrail). Delete the key → ciphertext becomes irrecoverable without touching a single Parquet file. No S3 rewrites, no pipeline pause. Completion SLA: 48 hours (well within GDPR's 30-day requirement).
 
 ---
@@ -227,7 +238,7 @@ Union-find graph with daily compaction in Lambda. Historical backfill: on identi
 | DynamoDB | On-demand | On-demand | Instant burst absorption |
 | ClickHouse | Sync inserts | Async insert buffer | Buffer flushes every 10s; no write pressure |
 
-**Pre-spike automation:** EventBridge rule monitors customer marketing calendar API. 30 minutes before a scheduled spike: split Kafka partitions to 100, scale Flink to 16 workers, notify on-call. Black Friday requires zero manual intervention.
+**Pre-spike automation:** EventBridge rule monitors customer marketing calendar API. 30 minutes before a scheduled spike: scale Flink to 16 workers, notify on-call. Black Friday requires zero manual intervention. (Kafka partitions are **not** changed mid-flight — adding partitions to a live topic breaks key-based routing for new events. The 50-partition pre-provisioning is sized to absorb 10× average load without modification.)
 
 **Circuit breaker:** If Flink→ClickHouse write queue exceeds 10 seconds of lag, degrade to pre-aggregated summaries only (1-minute buckets), skip row-level inserts. Raw data preserved in S3. Dashboard shows "aggregated mode — fine detail unavailable." Operators replay from Kafka when pressure normalizes.
 
@@ -344,7 +355,9 @@ Results (local Docker Compose, MacBook M-series):
 
 **Production scale targets** (architecture design, not local benchmark):
 - 65M events/day at 752 RPS sustained — achievable on 50-partition MSK + 4–32 Fargate tasks
-- 2.3s p95 end-to-end — Flink checkpoint interval 30s, ClickHouse async insert buffer 10s, dashboard poll 5s
+- **Two distinct latency paths:**
+  - *Raw event dashboard* (event count, top pages, real-time stream): 2–3s p95. Path: ingest → Kafka → ClickHouse async buffer (10s max) → dashboard poll (5s). No Flink involved.
+  - *Session-window processed metrics* (funnels, segments, session counts): 30–60s p95. Path: ingest → Kafka → Flink early firing (~30s) → ClickHouse → dashboard poll (5s). The 2.3s target applies to the first path only.
 
 The local demo runs a Python event processor (not production Flink) and a single-node ClickHouse container. It demonstrates the full data path and AI query feature are correct; production throughput requires the AWS deployment described above.
 
