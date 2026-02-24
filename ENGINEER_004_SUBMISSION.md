@@ -2,7 +2,7 @@
 
 **Gokul Krishnaa** | `[engineer-004] - Gokul Krishnaa`
 
-*Working demo: [github.com/gananthakris/real-time-analytics-demo](https://github.com/gananthakris/real-time-analytics-demo) — Docker Compose stack (Kafka + ClickHouse + Python processor + React dashboard). Local demo confirms full pipeline works end-to-end; production scale targets (65M events/day, 2.3s p95 e2e) are architecture design goals for the MSK + Fargate + ARM ClickHouse deployment described below.*
+*Working demo: [github.com/gananthakris/real-time-analytics-demo](https://github.com/gananthakris/real-time-analytics-demo) — Docker Compose stack (Kafka + ClickHouse + Python processor + React dashboard). Local demo confirms full pipeline works end-to-end; production scale targets (65M events/day, 2.3s p95 raw-event dashboard — see §4 for two distinct latency paths) are architecture design goals for the MSK + Fargate + ARM ClickHouse deployment described below.*
 
 ---
 
@@ -37,7 +37,7 @@ Every reprocessing job, schema migration, segment backfill, or GDPR correction i
 └──────────────────┬───────────────────────────────────────────────────────┘
                    │ MSK Kafka
                    │ 50 partitions · configurable retention
-                   │ Partition key = md5(customer_id + visitor_id)
+                   │ Partition key = customer_id + ":" + visitor_id
                    │
        ┌───────────┼──────────────────────────┐
        ▼           ▼                          ▼
@@ -63,7 +63,7 @@ Every reprocessing job, schema migration, segment backfill, or GDPR correction i
                         │
                ┌────────▼────────┐
                │  Dashboard API  │
-               │  WebSocket push │
+               │  HTTP poll (5s) │
                │  <3s p95 (raw) │
                └─────────────────┘
 ```
@@ -72,9 +72,9 @@ Every reprocessing job, schema migration, segment backfill, or GDPR correction i
 
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
-| Streaming | MSK Kafka, 50 partitions, ARM (m6g) | md5(customer_id+visitor_id) key ensures per-visitor event ordering (required for session detection); 50 partitions provide headroom at 10× average load |
+| Streaming | MSK Kafka, 50 partitions, ARM (m6g) | `customer_id + ":" + visitor_id` message key; Kafka's native murmur2 partitioner distributes evenly while guaranteeing per-visitor ordering (required for session detection); 50 partitions provide headroom at 10× average load |
 | Processing | PyFlink on Fargate Spot | $905/month (10 workers) vs KDA $3,330/month — 60% cheaper; full Python stack; full Flink control |
-| OLAP | ClickHouse only, ARM Graviton2 | Replaces Timestream+ClickHouse dual OLAP; sub-100ms p99 on billions of rows |
+| OLAP | ClickHouse only, ARM Graviton2 | Replaces Timestream+ClickHouse dual OLAP; sub-100ms p99 via materialized views (raw table queries: ~5s, as the MV comment below shows) |
 | User state | DynamoDB on-demand | Handles write bursts without capacity planning; single-digit ms writes |
 
 **War story — Timestream migration:** At a previous analytics SaaS, we started with Timestream for serverless simplicity. Hit $8K/month at 30M events/day. Complex JOINs degraded at scale (Timestream is column store optimized for IoT, not high-cardinality behavioral data). Migrated to ClickHouse: **$2K/month, 10× faster queries**. Lesson: one OLAP system with tiered storage outperforms two specialized systems operationally and economically.
@@ -134,7 +134,7 @@ Each statement is metadata-only, ~1 second, no table scan, no row lock. Total wa
 
 ### Multi-Tenant Isolation
 
-**Kafka:** 50 partitions (vs default 3). Partition key: `md5(customer_id + visitor_id)` — same visitor always routes to the same partition, guaranteeing per-visitor event ordering (critical for session detection). A single customer's traffic is intentionally spread across partitions for parallelism; per-tenant lag monitoring uses consumer group lag aggregated across all partitions.
+**Kafka:** 50 partitions (vs default 3). Partition key: `customer_id + ":" + visitor_id` — Kafka's built-in murmur2 partitioner then hashes this key to the partition index. Same visitor always routes to the same partition, guaranteeing per-visitor event ordering (critical for session detection). No application-level crypto hash needed; murmur2 distributes uniformly and is faster than MD5. A single customer's traffic is intentionally spread across partitions for parallelism; per-tenant lag monitoring uses consumer group lag aggregated across all partitions.
 
 **Redis token bucket rate limiter:**
 ```python
@@ -218,11 +218,11 @@ beam.WindowInto(
 - Device fingerprint: canvas, fonts, screen/timezone (60% confidence) — cross-session on same device
 - IP + User-Agent heuristics (40% confidence) — fallback for fingerprint-blocked browsers
 
-Union-find graph with daily compaction in Lambda. Historical backfill: on identity resolution, emit `identity_resolved` event to Kafka; Flink job reattributes last 30 days of S3 raw events into ClickHouse. Result: 95% of visitors identified (vs 60% with login-only).
+Union-find graph compacted by a nightly Fargate task (not Lambda — Lambda's 15-min limit and 10 GB memory cap make it unsuitable for large graphs at millions of nodes). Historical backfill: on identity resolution, emit `identity_resolved` event to Kafka; Flink job reattributes last 30 days of S3 raw events into ClickHouse. Design target: ~90–95% of visitors identified (vs ~60% with login-only), based on device fingerprinting coverage benchmarks from the open-source FingerprintJS literature.
 
 **GDPR — two-tier deletion:**
 - **Hot data (ClickHouse):** Drop each monthly partition for the customer: `ALTER TABLE events_raw DROP PARTITION ('customer_123', 202501)` — repeated per retained month (≤24 ops), each metadata-only, ~1 second each.
-- **Cold data (S3 Parquet):** Cryptographic shredding (from DDIA Ch. 12). All PII fields encrypted with per-user AES-256 keys in AWS Secrets Manager (deletion-protected, 7-day recovery window, all key deletions logged to CloudTrail). Delete the key → ciphertext becomes irrecoverable without touching a single Parquet file. No S3 rewrites, no pipeline pause. Completion SLA: 48 hours (well within GDPR's 30-day requirement).
+- **Cold data (S3 Parquet):** Cryptographic shredding (from DDIA Ch. 12). Envelope encryption: one KMS CMK per tenant ($1/month/key), per-user AES-256 Data Encryption Keys (DEKs) stored encrypted in DynamoDB. All PII fields in Parquet are encrypted with the user's DEK at write time. Deletion: remove the user's DEK row from DynamoDB → KMS can no longer decrypt the ciphertext → all Parquet containing that user's PII is irrecoverable. No S3 rewrites, no pipeline pause. All CMK key usage logged to CloudTrail. Completion SLA: 48 hours (well within GDPR's 30-day requirement). (Storing a unique key per user in Secrets Manager would cost $0.40/key/month — $400K/month at 1M users. The DEK-in-DynamoDB pattern scales economically to any user count.)
 
 ---
 
@@ -236,12 +236,12 @@ Union-find graph with daily compaction in Lambda. Historical backfill: on identi
 |-------|--------|-----------|-----------|
 | CloudFront | ∞ | ∞ | CDN |
 | ECS Fargate ingestion | 4 tasks | 32 tasks | CPU auto-scale (~90s) |
-| Kafka | 50 partitions | 50 partitions | Pre-split; 17× average-load headroom |
-| PyFlink workers | 4 | 16 | Pre-scaled before known events |
+| Kafka | 50 partitions | 50 partitions | Pre-split; 10× average-load headroom without repartitioning |
+| PyFlink workers | 4 | 16 | Pre-scaled via savepoint + restart (2–5 min); triggered 30 min before known spikes |
 | DynamoDB | On-demand | On-demand | Instant burst absorption |
 | ClickHouse | Sync inserts | Async insert buffer | Buffer flushes every 10s; no write pressure |
 
-**Pre-spike automation:** EventBridge rule monitors customer marketing calendar API. 30 minutes before a scheduled spike: scale Flink to 16 workers, notify on-call. Black Friday requires zero manual intervention. (Kafka partitions are **not** changed mid-flight — adding partitions to a live topic breaks key-based routing for new events. The 50-partition pre-provisioning is sized to absorb 10× average load without modification.)
+**Pre-spike automation:** EventBridge rule monitors customer marketing calendar API. 30 minutes before a scheduled spike: trigger a Flink savepoint, stop the job, restart at higher parallelism (16 workers), notify on-call. Flink stateful scaling requires savepoint+restart — unlike stateless ECS tasks it is not transparent in-place. 30 minutes of lead time absorbs this 2–5 minute window comfortably. Black Friday requires zero manual intervention. (Kafka partitions are **not** changed mid-flight — adding partitions to a live topic breaks key-based routing for new events. The 50-partition pre-provisioning is sized to absorb 10× average load without modification.)
 
 **Circuit breaker:** If Flink→ClickHouse write queue exceeds 10 seconds of lag, degrade to pre-aggregated summaries only (1-minute buckets), skip row-level inserts. Raw data preserved in S3. Dashboard shows "aggregated mode — fine detail unavailable." Operators replay from Kafka when pressure normalizes.
 
@@ -273,7 +273,7 @@ Discrepancies are classified: timing differences (events in different 1-minute b
 | Event-time correctness (session accuracy) | Flink stateful operator complexity |
 | Zero data loss (Kafka durability) | Dashboard latency during spikes (graceful degradation) |
 | Kappa simplicity (one codebase) | Slightly higher replay cost vs. specialized batch layer |
-| GDPR via crypto-shredding (no file rewrites) | Slightly higher Secrets Manager cost vs. in-place deletion |
+| GDPR via crypto-shredding (no file rewrites) | KMS + DynamoDB DEK overhead vs. in-place Parquet deletion |
 | Fargate Spot cost savings (60%) | Occasional Spot interruptions (Flink S3 checkpoints recover within 30s) |
 | Operational autonomy for 2 engineers | MSK/Kafka ecosystem's richer tooling vs. simpler managed Kinesis |
 
@@ -327,12 +327,12 @@ Surfaces actionable conclusions without requiring customers to build their own a
 | CloudFront + WAF | $500 | — |
 | MSK Kafka (3× m6g.large ARM, 50 partitions) | $280 | ARM saves 19% vs m5 |
 | PyFlink on Fargate Spot (10 workers) | $905 | **vs KDA $3,330 → saves $2,424/month (60%)** |
-| ClickHouse (3× r6g.4xlarge ARM, 1-yr reserved, incl. io2 EBS) | $6,100 | **Replaces Timestream $8K + old CH $6K → saves $7,860/month** |
+| ClickHouse (3× r6g.4xlarge ARM, 1-yr reserved, incl. gp3 EBS 2TB/node) | $6,100 | **Replaces Timestream $8K + old CH $6K → saves $7,860/month** |
 | DynamoDB on-demand | $800 | — |
 | ElastiCache Redis (r7g.large HA) | $400 | ARM saves ~15% vs r7i |
 | S3 + Glacier lifecycle | $600 | Raw events, Flink checkpoints |
 | Kinesis Firehose → Snowflake/BigQuery | $300 | Optional warehouse export |
-| Secrets Manager (GDPR per-user AES-256 keys) | $200 | — |
+| KMS CMK per tenant + DynamoDB DEKs (GDPR crypto-shredding) | $200 | Envelope encryption scales to any user count; per-user Secrets Manager keys would cost $400K+/month at scale |
 | Bedrock Claude API (NL→SQL, 80% cache) | $81 | Unique feature — Claude's baseline: $0 |
 | Lambda, ECR, Route53, misc | $500 | — |
 | Data transfer, CloudWatch Logs + metrics (50M events/day) | $3,500 | Largest hidden cost at this event volume |
